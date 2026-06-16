@@ -12,7 +12,7 @@ High-throughput stochastic stress-injection tool designed to validate and perfor
 To simulate mass deployment without crashing host infrastructure, the engine bypasses traditional operating system socket limitations through advanced virtualization mechanics:
 
 ```mermaid
-graph LR
+graph TD
     A[Thousands of Virtual ESP32s] -->|Stochastic Data| B(Asyncio Semaphore)
     B -->|Throttling| C[Shared TCP Socket Pool]
     C -->|High-Throughput MQTT| D((Mosquitto Broker))
