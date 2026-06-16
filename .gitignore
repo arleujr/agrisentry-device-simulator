@@ -1,0 +1,14 @@
+# Ambientes Virtuais
+venv/
+env/
+
+# Cache
+__pycache__/
+*.pyc
+
+# Segredos
+.env
+.env.*
+
+# OS
+.DS_Store
