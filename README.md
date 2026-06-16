@@ -19,6 +19,7 @@ graph TD
     D -->|Ingestion| E[AgriSentry Rust Gateway]
 ```
 
+
 * **Virtualization Pooling:** Instead of dedicating individual TCP sockets per simulated edge node (which triggers system file descriptor exhaustion `Too many open files`), the engine routes thousands of virtual devices across a tight pool of stable, shared multiplexed TCP connections.
 * **Concurrency Control:** Leverages asynchronous semaphores (`asyncio.Semaphore`) to throttle instantaneous publishing bursts, eliminating infinite internal memory buffering and preventing local event-loop saturation.
 
