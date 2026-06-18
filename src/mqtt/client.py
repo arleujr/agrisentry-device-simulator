@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 from models.payload import SensorPayload
 from sensors.generators import SensorSimulator
-from mqtt.client import AsyncMqttPublisher
+
 
 # Professional logging configuration
 logging.basicConfig(
