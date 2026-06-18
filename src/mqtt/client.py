@@ -1,65 +1,104 @@
 import asyncio
+import sys
 import logging
-import aiomqtt
-from storage.edge_cache import save_offline_payload, drain_offline_cache
+import uuid
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+from models.payload import SensorPayload
+from sensors.generators import SensorSimulator
+from mqtt.client import AsyncMqttPublisher
 
-logger = logging.getLogger(__name__)
+# Professional logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("AgrisentryDevice")
 
-class AsyncMqttPublisher:
-    """
-    Production-ready asynchronous MQTT publisher.
-    Handles automatic reconnections, offline caching, and queue draining.
-    """
-    def __init__(self, broker_host: str, client_id: str):
-        self.broker_host = broker_host
-        self.client_id = client_id
-        # In-memory queue to decouple sensor generation from network latency
-        self.queue = asyncio.Queue(maxsize=1000) 
+# Simulated fixed Edge Device ID - Força o ID a mudar a cada deploy para evitar choque de Client ID
+EDGE_DEVICE_ID = f"esp32-gate-{uuid.uuid4().hex[:6]}"
+ACTIVE_SENSORS = ["TEMPERATURE", "HUMIDITY", "SOIL_MOISTURE", "LUMINOSITY"]
 
-    async def add_to_queue(self, topic: str, payload_json: str):
-        """ Adds a payload to the publishing queue. """
-        try:
-            self.queue.put_nowait((topic, payload_json))
-        except asyncio.QueueFull:
-            logger.warning("In-memory MQTT queue is full! Forcing to Edge Cache.")
-            await save_offline_payload(payload_json)
+# SE ESTIVER NO RENDER, USA O EMQX, SE ESTIVER LOCAL, USA O LOCALHOST
+MQTT_BROKER_HOST = os.getenv("MQTT_BROKER_HOST", "broker.emqx.io")
 
-    async def worker_loop(self):
-        """
-        Background worker that maintains the MQTT connection and processes the queue.
-        """
-        reconnect_interval = 3 # seconds
-        
+# --- Servidor HTTP Fake para enganar o Render (De Graça como Web Service) ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        return # Silencia os logs de HTTP para não poluir o terminal
+
+def start_fake_web_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info(f"🌐 Fake Health Check Server started on port {port}")
+    server.serve_forever()
+# ----------------------------------------------------------------------------
+
+async def sensor_worker(sensor_type: str, simulator: SensorSimulator, publisher: AsyncMqttPublisher, interval_seconds: int = 5):
+    try:
         while True:
-            try:
-                logger.info(f"Connecting to MQTT Broker at {self.broker_host}...")
-                
-                async with aiomqtt.Client(hostname=self.broker_host, identifier=self.client_id) as client:
-                    logger.info("Successfully connected to MQTT Broker!")
-                    
-                    # Connection restored: First priority is to drain the offline cache
-                    cached_payloads = await drain_offline_cache()
-                    for payload in cached_payloads:
-                        # Assuming a unified telemetry topic for the gateway
-                        topic = f"agrisentry/gateway/{self.client_id}/telemetry"
-                        await client.publish(topic, payload, qos=1)
-                        await asyncio.sleep(0.05) # Prevent broker flooding
-                    
-                    # Process live data from the queue
-                    while True:
-                        topic, payload_json = await self.queue.get()
-                        
-                        try:
-                            await client.publish(topic, payload_json, qos=1)
-                            self.queue.task_done()
-                        except aiomqtt.MqttError as e:
-                            logger.error(f"Failed to publish message: {e}. Routing to Edge Cache.")
-                            await save_offline_payload(payload_json)
-                            raise # Trigger reconnection
-                            
-            except aiomqtt.MqttError:
-                logger.error(f"MQTT connection lost. Retrying in {reconnect_interval}s...")
-                await asyncio.sleep(reconnect_interval)
-            except asyncio.CancelledError:
-                logger.info("MQTT Publisher worker terminating cleanly.")
-                break
+            raw_value = simulator.generate_reading(sensor_type)
+            
+            payload = SensorPayload(
+                device_id=EDGE_DEVICE_ID,
+                sensor_type=sensor_type,
+                reading_value=raw_value
+            )
+            
+            payload_json = payload.model_dump_json()
+            topic = f"agrisentry/gateway/{EDGE_DEVICE_ID}/telemetry"
+            
+            await publisher.add_to_queue(topic, payload_json)
+            logger.info(f"[{sensor_type}] Queued -> {raw_value}")
+            
+            await asyncio.sleep(interval_seconds)
+            
+    except asyncio.CancelledError:
+        logger.info(f"Sensor worker {sensor_type} received shutdown signal.")
+        raise
+
+async def main():
+    logger.info(f"Starting AgriSentry Edge Simulator (MQTT Enabled): {EDGE_DEVICE_ID}")
+    
+    # Inicia o servidor fake em uma thread separada para não travar o asyncio
+    threading.Thread(target=start_fake_web_server, daemon=True).start()
+    
+    simulator = SensorSimulator(anomaly_probability=0.05)
+    publisher = AsyncMqttPublisher(broker_host=MQTT_BROKER_HOST, client_id=EDGE_DEVICE_ID)
+    
+    tasks = []
+    
+    mqtt_task = asyncio.create_task(publisher.worker_loop(), name="MQTT_Worker")
+    tasks.append(mqtt_task)
+    
+    for sensor in ACTIVE_SENSORS:
+        await asyncio.sleep(0.5) 
+        task = asyncio.create_task(
+            sensor_worker(sensor, simulator, publisher, interval_seconds=10),
+            name=f"Sensor_{sensor}"
+        )
+        tasks.append(task)
+        
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        logger.info("Main orchestrator shutting down...")
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+if __name__ == "__main__":
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Application stopped gracefully by the user/system.")
